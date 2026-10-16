@@ -10,6 +10,7 @@
 #ifdef HYPERATE_HAVE_LIBWEBSOCKETS
 struct lws;
 struct lws_context;
+struct lws_vhost;
 #endif
 
 namespace hyperate {
@@ -66,6 +67,7 @@ private:
 
 #ifdef HYPERATE_HAVE_LIBWEBSOCKETS
 	void open_connection();
+	bool connect_via(::lws_vhost *vhost, bool via_proxy);
 	void request_close();
 	void send_join_frame();
 	void send_leave_frame();
@@ -92,6 +94,15 @@ private:
 #ifdef HYPERATE_HAVE_LIBWEBSOCKETS
 	::lws_context *lws_context_ = nullptr; // published under command_mutex_ for wake_service_thread()
 	::lws *wsi_ = nullptr;
+	// Two vhosts share the one context: "direct" never uses a proxy, "proxy" tunnels
+	// through a detected HTTP proxy. A connection tries direct first and only falls
+	// back to the proxy vhost if that fails, so proxy users and direct users both work
+	// with no extra settings.
+	::lws_vhost *direct_vhost_ = nullptr;
+	::lws_vhost *proxy_vhost_ = nullptr;
+	std::string proxy_;               // "[user:pass@]host:port" or empty if none detected
+	bool via_proxy_now_ = false;      // is the in-flight attempt the proxy one
+	bool proxy_retry_pending_ = false;// direct failed; start the proxy attempt in the loop
 	bool closing_ = false;
 	std::deque<std::string> pending_messages_;
 	std::chrono::steady_clock::time_point next_heartbeat_{};

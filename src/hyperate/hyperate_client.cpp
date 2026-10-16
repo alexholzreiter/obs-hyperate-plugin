@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <sstream>
@@ -16,6 +17,10 @@
 
 #ifdef HYPERATE_HAVE_LIBWEBSOCKETS
 #include <libwebsockets.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <winhttp.h>
+#endif
 #endif
 
 namespace hyperate {
@@ -127,6 +132,143 @@ long long unix_time_millis()
 }
 
 #ifdef HYPERATE_HAVE_LIBWEBSOCKETS
+
+std::string trim_copy(std::string s)
+{
+	while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+		s.erase(s.begin());
+	while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+		s.pop_back();
+	return s;
+}
+
+// Reduce a proxy URL to the "[user:pass@]host:port" form libwebsockets wants for an
+// HTTP CONNECT proxy. SOCKS proxies are rejected (empty) because the CONNECT path
+// cannot use them.
+std::string normalize_http_proxy(const std::string &input)
+{
+	std::string s = trim_copy(input);
+	if (s.empty())
+		return {};
+
+	const size_t scheme_end = s.find("://");
+	if (scheme_end != std::string::npos) {
+		std::string scheme = s.substr(0, scheme_end);
+		std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+			       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (scheme.rfind("socks", 0) == 0)
+			return {};
+		s = s.substr(scheme_end + 3);
+	}
+
+	while (!s.empty() && (s.back() == '/' || std::isspace(static_cast<unsigned char>(s.back()))))
+		s.pop_back();
+
+	// A bare host without a port is not a usable proxy here.
+	return s.find(':') == std::string::npos ? std::string{} : s;
+}
+
+#if defined(_WIN32)
+std::string wide_to_utf8(const wchar_t *w)
+{
+	if (!w)
+		return {};
+	const int needed = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+	if (needed <= 1)
+		return {};
+	std::string out(static_cast<size_t>(needed - 1), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), needed, nullptr, nullptr);
+	return out;
+}
+
+// The Windows "manual proxy" string is either "host:port" or a per-scheme list such
+// as "http=host:port;https=host:port". Prefer the https entry (we tunnel TLS), then
+// http, then a plain host:port. PAC/auto-config URLs are ignored.
+std::string pick_windows_proxy_entry(const std::string &raw)
+{
+	std::string https_val, http_val, plain;
+	std::string token;
+	auto consume = [&](const std::string &tok) {
+		std::string t = trim_copy(tok);
+		if (t.empty())
+			return;
+		const size_t eq = t.find('=');
+		if (eq == std::string::npos) {
+			if (plain.empty())
+				plain = t;
+			return;
+		}
+		std::string scheme = t.substr(0, eq);
+		std::string value = t.substr(eq + 1);
+		std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+			       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (scheme == "https" && https_val.empty())
+			https_val = value;
+		else if (scheme == "http" && http_val.empty())
+			http_val = value;
+	};
+	for (char c : raw) {
+		if (c == ';' || c == ' ') {
+			consume(token);
+			token.clear();
+		} else {
+			token.push_back(c);
+		}
+	}
+	consume(token);
+
+	if (!https_val.empty())
+		return https_val;
+	if (!http_val.empty())
+		return http_val;
+	return plain;
+}
+
+std::string detect_windows_system_proxy()
+{
+	WINHTTP_CURRENT_USER_IE_PROXY_CONFIG cfg{};
+	if (!WinHttpGetIEProxyConfigForCurrentUser(&cfg))
+		return {};
+
+	std::string result;
+	if (cfg.lpszProxy)
+		result = pick_windows_proxy_entry(wide_to_utf8(cfg.lpszProxy));
+
+	if (cfg.lpszProxy)
+		GlobalFree(cfg.lpszProxy);
+	if (cfg.lpszProxyBypass)
+		GlobalFree(cfg.lpszProxyBypass);
+	if (cfg.lpszAutoConfigUrl)
+		GlobalFree(cfg.lpszAutoConfigUrl);
+
+	return result;
+}
+#endif // _WIN32
+
+// Find an HTTP(S) proxy the OS/user has configured, used only as a fallback when a
+// direct connection fails. Environment variables first (cross-platform), then the
+// Windows manual system proxy.
+std::string detect_http_proxy()
+{
+	for (const char *name : {"https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy",
+				 "ALL_PROXY"}) {
+		const char *value = std::getenv(name);
+		if (value && *value) {
+			std::string normalized = normalize_http_proxy(value);
+			if (!normalized.empty())
+				return normalized;
+		}
+	}
+
+#if defined(_WIN32)
+	std::string system_proxy = detect_windows_system_proxy();
+	if (!system_proxy.empty())
+		return normalize_http_proxy(system_proxy);
+#endif
+
+	return {};
+}
+
 int hyperate_lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *, void *in, size_t len)
 {
 	auto *client = static_cast<HyperateClient *>(lws_get_opaque_user_data(wsi));
@@ -264,6 +406,8 @@ void HyperateClient::run()
 	protocols[0].per_session_data_size = 0;
 	protocols[0].rx_buffer_size = 4096;
 
+	proxy_ = detect_http_proxy();
+
 	lws_context_creation_info info{};
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.protocols = protocols;
@@ -273,12 +417,33 @@ void HyperateClient::run()
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.uid = -1;
 	info.gid = -1;
+	info.vhost_name = "hyperate-direct";
+	// A non-NULL (empty) proxy address makes libwebsockets ignore the http_proxy
+	// environment variable for this vhost. Otherwise it would silently tunnel every
+	// connection through an inherited proxy and fail when that proxy is wrong or gone
+	// (e.g. a lingering HTTP_PROXY var on Windows), even when a direct route works.
+	info.http_proxy_address = "";
 
 	lws_context *context = lws_create_context(&info);
 	if (!context) {
 		set_status(ConnectionStatus::Error, "Could not create WebSocket context");
 		HYPERATE_LOG(LOG_ERROR, "Could not create libwebsockets context");
 		return;
+	}
+
+	direct_vhost_ = lws_get_vhost_by_name(context, "hyperate-direct");
+
+	if (!proxy_.empty()) {
+		lws_context_creation_info proxy_info = info;
+		proxy_info.vhost_name = "hyperate-proxy";
+		proxy_info.http_proxy_address = proxy_.c_str();
+		proxy_info.http_proxy_port = 0; // parsed from the address string
+		proxy_vhost_ = lws_create_vhost(context, &proxy_info);
+		if (proxy_vhost_)
+			HYPERATE_LOG(LOG_INFO, "Proxy fallback available (%s)", proxy_.c_str());
+		else
+			HYPERATE_LOG(LOG_WARNING, "Could not create proxy fallback vhost for %s",
+				     proxy_.c_str());
 	}
 
 	{
@@ -315,6 +480,14 @@ void HyperateClient::run()
 
 		lws_service(context, 100);
 
+		// A direct attempt failed and a proxy is available: start the proxy attempt
+		// here rather than inside the error callback, to avoid reconnecting while
+		// libwebsockets is still tearing the failed connection down.
+		if (proxy_retry_pending_ && !wsi_ && !shutdown_) {
+			proxy_retry_pending_ = false;
+			connect_via(proxy_vhost_, true);
+		}
+
 		const auto now = std::chrono::steady_clock::now();
 		if (wsi_ && !handshake_timed_out_ && status() == ConnectionStatus::Connecting &&
 		    now >= handshake_deadline_) {
@@ -337,6 +510,8 @@ void HyperateClient::run()
 	}
 	lws_context_destroy(context);
 	wsi_ = nullptr;
+	direct_vhost_ = nullptr;
+	proxy_vhost_ = nullptr;
 	pending_messages_.clear();
 #endif
 }
@@ -347,18 +522,27 @@ void HyperateClient::open_connection()
 	if (wsi_ || config_.channel_id.empty())
 		return;
 
+	// Always start with the direct route; the proxy vhost is only used as a fallback.
+	proxy_retry_pending_ = false;
+	connect_via(direct_vhost_, false);
+}
+
+bool HyperateClient::connect_via(::lws_vhost *vhost, bool via_proxy)
+{
 	const std::string connect_path = build_connect_path(config_.path, config_.channel_id, config_.api_key);
-	HYPERATE_LOG(LOG_INFO, "Opening WebSocket to wss://%s%s", config_.host.c_str(),
-		     redact_token(connect_path).c_str());
+	HYPERATE_LOG(LOG_INFO, "Opening WebSocket to wss://%s%s%s", config_.host.c_str(),
+		     redact_token(connect_path).c_str(), via_proxy ? " via proxy" : "");
 
 	pending_messages_.clear();
 	closing_ = false;
+	via_proxy_now_ = via_proxy;
 	handshake_timed_out_ = false;
 	handshake_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 	next_heartbeat_ = std::chrono::steady_clock::now() + std::chrono::seconds(15);
 
 	lws_client_connect_info connect_info{};
 	connect_info.context = lws_context_;
+	connect_info.vhost = vhost; // selects direct vs. proxy (and its SSL_CTX)
 	connect_info.address = config_.host.c_str();
 	connect_info.port = config_.port;
 	connect_info.path = connect_path.c_str();
@@ -372,12 +556,14 @@ void HyperateClient::open_connection()
 	connect_info.pwsi = &wsi_;
 	connect_info.ssl_connection = config_.use_tls ? LCCSCF_USE_SSL : 0;
 
-	set_status(ConnectionStatus::Connecting, "Connecting");
+	set_status(ConnectionStatus::Connecting, via_proxy ? "Connecting via proxy" : "Connecting");
 	wsi_ = lws_client_connect_via_info(&connect_info);
 	if (!wsi_) {
 		set_status(ConnectionStatus::Error, "Could not start WebSocket connection");
 		HYPERATE_LOG(LOG_ERROR, "Could not start WebSocket connection");
+		return false;
 	}
+	return true;
 }
 
 void HyperateClient::request_close()
@@ -476,10 +662,21 @@ int HyperateClient::on_lws_writable()
 
 void HyperateClient::on_lws_connection_error()
 {
-	HYPERATE_LOG(LOG_ERROR, "WebSocket connection failed");
 	wsi_ = nullptr;
 	closing_ = false;
 	pending_messages_.clear();
+
+	// Direct route failed but we have a proxy we have not tried yet: fall back to it.
+	// The actual reconnect happens in the service loop, not inside this callback.
+	if (proxy_vhost_ && !via_proxy_now_) {
+		HYPERATE_LOG(LOG_WARNING, "Direct WebSocket connection failed; retrying via proxy (%s)",
+			     proxy_.c_str());
+		proxy_retry_pending_ = true;
+		set_status(ConnectionStatus::Connecting, "Connecting via proxy");
+		return;
+	}
+
+	HYPERATE_LOG(LOG_ERROR, "WebSocket connection failed");
 	heart_rate_state().set_live(false);
 	set_status(ConnectionStatus::Error, "WebSocket connection failed");
 }

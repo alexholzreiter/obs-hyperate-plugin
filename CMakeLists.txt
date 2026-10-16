@@ -105,7 +105,8 @@ if(HYPERATE_WITH_LIBWEBSOCKETS AND HYPERATE_LWS_TARGET)
   if(WIN32)
     # System libraries the static dependencies rely on: OpenSSL needs the TLS and
     # cert-store APIs, libuv needs sockets plus dbghelp (SymGetOptions,
-    # MiniDumpWriteDump) and the shell/COM APIs for process handling.
+    # MiniDumpWriteDump) and the shell/COM APIs for process handling. winhttp is
+    # used to read the Windows system proxy for the connection fallback.
     target_link_libraries(
       ${CMAKE_PROJECT_NAME}
       PRIVATE
@@ -120,6 +121,7 @@ if(HYPERATE_WITH_LIBWEBSOCKETS AND HYPERATE_LWS_TARGET)
         ole32
         shell32
         psapi
+        winhttp
     )
   endif()
 elseif(HYPERATE_WITH_LIBWEBSOCKETS AND LIBWEBSOCKETS_FOUND)
