@@ -39,6 +39,9 @@ struct BpmDisplaySource {
 	bool show_when_disconnected = true;
 	bool glow_enabled = false;
 	double glow_softness = 6.0;
+	bool outline_enabled = false;
+	uint32_t outline_color = 0xFF000000;
+	int outline_size = 4;
 	double active_bpm = 100.0;
 	double high_bpm = 130.0;
 	double peak_bpm = 160.0;
@@ -53,6 +56,8 @@ struct BpmDisplaySource {
 	std::string cached_font_face;
 	int cached_font_size = 0;
 	int cached_font_flags = 0;
+	uint32_t cached_outline_color = 0;
+	int cached_outline_size = 0;
 	bool cached_font_valid = false;
 };
 
@@ -121,6 +126,9 @@ void bpm_display_update(void *data, obs_data_t *settings)
 	display->show_when_disconnected = obs_data_get_bool(settings, "show_when_disconnected");
 	display->glow_enabled = obs_data_get_bool(settings, "glow_enabled");
 	display->glow_softness = std::clamp(obs_data_get_double(settings, "glow_softness"), 1.0, 32.0);
+	display->outline_enabled = obs_data_get_bool(settings, "outline_enabled");
+	display->outline_color = (uint32_t)obs_data_get_int(settings, "outline_color");
+	display->outline_size = (int)std::clamp(obs_data_get_int(settings, "outline_size"), 1LL, 32LL);
 	display->active_bpm = std::clamp(obs_data_get_double(settings, "active_bpm"), 1.0, 300.0);
 	display->high_bpm = std::clamp(obs_data_get_double(settings, "high_bpm"), display->active_bpm + 1.0, 300.0);
 	display->peak_bpm = std::clamp(obs_data_get_double(settings, "peak_bpm"), display->high_bpm + 1.0, 300.0);
@@ -143,15 +151,16 @@ void bpm_display_destroy(void *data)
 	delete display;
 }
 
-void draw_rect(float x, float y, float width, float height)
+void draw_rect(float x, float y, float width, float height, float grow = 0.0f)
 {
 	gs_matrix_push();
-	gs_matrix_translate3f(x, y, 0.0f);
-	gs_draw_sprite(nullptr, 0, (uint32_t)width, (uint32_t)height);
+	gs_matrix_translate3f(x - grow, y - grow, 0.0f);
+	gs_draw_sprite(nullptr, 0, (uint32_t)(width + (2.0f * grow)), (uint32_t)(height + (2.0f * grow)));
 	gs_matrix_pop();
 }
 
-void draw_digit(uint8_t segments, float x, float y, float digit_width, float digit_height, float thickness)
+void draw_digit(uint8_t segments, float x, float y, float digit_width, float digit_height, float thickness,
+		float grow)
 {
 	const float horizontal_width = digit_width - (2.0f * thickness);
 	const float vertical_height = (digit_height - (3.0f * thickness)) * 0.5f;
@@ -160,19 +169,19 @@ void draw_digit(uint8_t segments, float x, float y, float digit_width, float dig
 	const float bottom_y = y + digit_height - thickness;
 
 	if (segments & SegmentTop)
-		draw_rect(x + thickness, y, horizontal_width, thickness);
+		draw_rect(x + thickness, y, horizontal_width, thickness, grow);
 	if (segments & SegmentMiddle)
-		draw_rect(x + thickness, mid_y, horizontal_width, thickness);
+		draw_rect(x + thickness, mid_y, horizontal_width, thickness, grow);
 	if (segments & SegmentBottom)
-		draw_rect(x + thickness, bottom_y, horizontal_width, thickness);
+		draw_rect(x + thickness, bottom_y, horizontal_width, thickness, grow);
 	if (segments & SegmentUpperLeft)
-		draw_rect(x, y + thickness, thickness, vertical_height);
+		draw_rect(x, y + thickness, thickness, vertical_height, grow);
 	if (segments & SegmentUpperRight)
-		draw_rect(right, y + thickness, thickness, vertical_height);
+		draw_rect(right, y + thickness, thickness, vertical_height, grow);
 	if (segments & SegmentLowerLeft)
-		draw_rect(x, mid_y + thickness, thickness, vertical_height);
+		draw_rect(x, mid_y + thickness, thickness, vertical_height, grow);
 	if (segments & SegmentLowerRight)
-		draw_rect(right, mid_y + thickness, thickness, vertical_height);
+		draw_rect(right, mid_y + thickness, thickness, vertical_height, grow);
 }
 
 void digit_metrics(int style, float digit_height, float *digit_width, float *thickness, float *spacing)
@@ -202,11 +211,11 @@ void digit_metrics(int style, float digit_height, float *digit_width, float *thi
 	}
 }
 
-void draw_dash(float x, float y, float digit_width, float digit_height, float thickness)
+void draw_dash(float x, float y, float digit_width, float digit_height, float thickness, float grow)
 {
 	const float horizontal_width = digit_width - (2.0f * thickness);
 	const float mid_y = y + ((digit_height - thickness) * 0.5f);
-	draw_rect(x + thickness, mid_y, horizontal_width, thickness);
+	draw_rect(x + thickness, mid_y, horizontal_width, thickness, grow);
 }
 
 struct DisplayValue {
@@ -279,16 +288,132 @@ void invalidate_text_texture(BpmDisplaySource *display)
 	display->cached_font_valid = false;
 }
 
+int effective_outline_size(const BpmDisplaySource *display)
+{
+	return display->outline_enabled ? display->outline_size : 0;
+}
+
+// Felzenszwalb & Huttenlocher 1D squared distance transform.
+void distance_transform_1d(const float *f, int n, float *d, int *v, float *z)
+{
+	constexpr float inf = 1e20f;
+	int k = 0;
+	v[0] = 0;
+	z[0] = -inf;
+	z[1] = inf;
+	for (int q = 1; q < n; ++q) {
+		float s = ((f[q] + (float)(q * q)) - (f[v[k]] + (float)(v[k] * v[k]))) / (float)(2 * q - 2 * v[k]);
+		while (s <= z[k]) {
+			--k;
+			s = ((f[q] + (float)(q * q)) - (f[v[k]] + (float)(v[k] * v[k]))) / (float)(2 * q - 2 * v[k]);
+		}
+		++k;
+		v[k] = q;
+		z[k] = s;
+		z[k + 1] = inf;
+	}
+	k = 0;
+	for (int q = 0; q < n; ++q) {
+		while (z[k + 1] < (float)q)
+			++k;
+		const float delta = (float)(q - v[k]);
+		d[q] = (delta * delta) + f[v[k]];
+	}
+}
+
+std::vector<uint8_t> outline_coverage(const std::vector<uint8_t> &mask, int width, int height, int radius)
+{
+	constexpr float inf = 1e20f;
+	const int longest = std::max(width, height);
+	std::vector<float> grid((size_t)width * (size_t)height);
+	for (size_t i = 0; i < grid.size(); ++i)
+		grid[i] = mask[i] >= 128 ? 0.0f : inf;
+
+	std::vector<float> f((size_t)longest);
+	std::vector<float> d((size_t)longest);
+	std::vector<int> v((size_t)longest);
+	std::vector<float> z((size_t)longest + 1);
+
+	for (int x = 0; x < width; ++x) {
+		for (int y = 0; y < height; ++y)
+			f[(size_t)y] = grid[(size_t)y * width + x];
+		distance_transform_1d(f.data(), height, d.data(), v.data(), z.data());
+		for (int y = 0; y < height; ++y)
+			grid[(size_t)y * width + x] = d[(size_t)y];
+	}
+	for (int y = 0; y < height; ++y) {
+		float *row = grid.data() + (size_t)y * width;
+		std::copy(row, row + width, f.begin());
+		distance_transform_1d(f.data(), width, d.data(), v.data(), z.data());
+		std::copy(d.begin(), d.begin() + width, row);
+	}
+
+	std::vector<uint8_t> coverage(grid.size());
+	for (size_t i = 0; i < grid.size(); ++i) {
+		const float value = std::clamp((float)radius + 1.0f - std::sqrt(grid[i]), 0.0f, 1.0f);
+		coverage[i] = std::max(mask[i], (uint8_t)std::lround(value * 255.0f));
+	}
+	return coverage;
+}
+
+void create_text_texture(BpmDisplaySource *display, const std::string &text, uint32_t color,
+			 const std::vector<uint8_t> &mask)
+{
+	const int width = (int)display->width;
+	const int height = (int)display->height;
+	const int outline_size = effective_outline_size(display);
+	std::vector<uint8_t> outline;
+	if (outline_size > 0)
+		outline = outline_coverage(mask, width, height, outline_size);
+
+	const float text_rgb[] = {(float)((color >> 16) & 0xFF), (float)((color >> 8) & 0xFF),
+				  (float)((color >> 0) & 0xFF)};
+	const float text_alpha = (float)((color >> 24) & 0xFF) / 255.0f;
+	const uint32_t oc = display->outline_color;
+	const float outline_rgb[] = {(float)((oc >> 16) & 0xFF), (float)((oc >> 8) & 0xFF), (float)((oc >> 0) & 0xFF)};
+	const float outline_alpha = (float)((oc >> 24) & 0xFF) / 255.0f;
+
+	std::vector<uint8_t> pixels(mask.size() * 4, 0);
+	for (size_t i = 0; i < mask.size(); ++i) {
+		const float ta = text_alpha * ((float)mask[i] / 255.0f);
+		const float oa = outline.empty() ? 0.0f : outline_alpha * ((float)outline[i] / 255.0f) * (1.0f - ta);
+		const float alpha = ta + oa;
+		if (alpha <= 0.0f)
+			continue;
+		for (int c = 0; c < 3; ++c) {
+			const float value = ((text_rgb[c] * ta) + (outline_rgb[c] * oa)) / alpha;
+			pixels[(i * 4) + c] = (uint8_t)std::clamp(std::lround(value), 0l, 255l);
+		}
+		pixels[(i * 4) + 3] = (uint8_t)std::clamp(std::lround(alpha * 255.0f), 0l, 255l);
+	}
+
+	const uint8_t *texture_data = pixels.data();
+	display->text_texture = gs_texture_create(display->width, display->height, GS_BGRA, 1, &texture_data, 0);
+	display->cached_font_valid = display->text_texture != nullptr;
+	display->cached_text = text;
+	display->cached_color = color;
+	display->cached_width = display->width;
+	display->cached_height = display->height;
+	display->cached_font_face = display->font_face;
+	display->cached_font_size = display->font_size;
+	display->cached_font_flags = display->font_flags;
+	display->cached_outline_color = display->outline_color;
+	display->cached_outline_size = outline_size;
+}
+
 void ensure_system_font_texture(BpmDisplaySource *display, const std::string &text, uint32_t color)
 {
 	if (display->cached_font_valid && display->text_texture && display->cached_text == text &&
 	    display->cached_color == color && display->cached_width == display->width &&
 	    display->cached_height == display->height && display->cached_font_face == display->font_face &&
-	    display->cached_font_size == display->font_size && display->cached_font_flags == display->font_flags) {
+	    display->cached_font_size == display->font_size && display->cached_font_flags == display->font_flags &&
+	    display->cached_outline_color == display->outline_color &&
+	    display->cached_outline_size == effective_outline_size(display)) {
 		return;
 	}
 
 	invalidate_text_texture(display);
+	const int outline_margin = effective_outline_size(display) * 2;
 
 #ifdef __APPLE__
 	if (display->width == 0 || display->height == 0 || text.empty())
@@ -308,11 +433,8 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 	CGContextSetShouldAntialias(context, true);
 	CGContextSetAllowsAntialiasing(context, true);
 
-	const CGFloat red = (CGFloat)((color >> 0) & 0xFF) / 255.0f;
-	const CGFloat green = (CGFloat)((color >> 8) & 0xFF) / 255.0f;
-	const CGFloat blue = (CGFloat)((color >> 16) & 0xFF) / 255.0f;
-	const CGFloat alpha = (CGFloat)((color >> 24) & 0xFF) / 255.0f;
-	CGColorRef text_color = CGColorCreateGenericRGB(red, green, blue, alpha);
+	// Render a white coverage mask; color and outline are composited afterwards.
+	CGColorRef text_color = CGColorCreateGenericRGB(1.0, 1.0, 1.0, 1.0);
 	CFStringRef text_string = CFStringCreateWithCString(kCFAllocatorDefault, text.c_str(), kCFStringEncodingUTF8);
 
 	auto create_font = [&](CGFloat size) -> CTFontRef {
@@ -350,8 +472,8 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 		return line;
 	};
 
-	const CGFloat max_text_width = (CGFloat)display->width * 0.92f;
-	const CGFloat max_text_height = (CGFloat)display->height * 0.84f;
+	const CGFloat max_text_width = std::max((CGFloat)1.0, (CGFloat)display->width * 0.92f - outline_margin);
+	const CGFloat max_text_height = std::max((CGFloat)1.0, (CGFloat)display->height * 0.84f - outline_margin);
 	CGFloat effective_font_size = std::min((CGFloat)display->font_size, std::max((CGFloat)8.0, max_text_height));
 	CTFontRef font = create_font(effective_font_size);
 	if (!font) {
@@ -403,23 +525,16 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 	CFRelease(font);
 	CGContextRelease(context);
 
-	const uint8_t *texture_data = pixels.data();
-	display->text_texture = gs_texture_create(display->width, display->height, GS_BGRA, 1, &texture_data, 0);
-	display->cached_font_valid = display->text_texture != nullptr;
-	display->cached_text = text;
-	display->cached_color = color;
-	display->cached_width = display->width;
-	display->cached_height = display->height;
-	display->cached_font_face = display->font_face;
-	display->cached_font_size = display->font_size;
-	display->cached_font_flags = display->font_flags;
+	std::vector<uint8_t> mask((size_t)display->width * (size_t)display->height);
+	for (size_t i = 0; i < mask.size(); ++i)
+		mask[i] = pixels[(i * 4) + 3];
+	create_text_texture(display, text, color, mask);
 #elif defined(_WIN32)
 	if (display->width == 0 || display->height == 0 || text.empty())
 		return;
 
 	const int width = (int)display->width;
 	const int height = (int)display->height;
-	std::vector<uint8_t> pixels((size_t)width * (size_t)height * 4, 0);
 
 	HDC screen_dc = GetDC(nullptr);
 	if (!screen_dc)
@@ -500,8 +615,8 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 		SelectObject(memory_dc, old_font);
 	};
 
-	const int max_text_width = std::max(1, (int)((double)width * 0.92));
-	const int max_text_height = std::max(1, (int)((double)height * 0.84));
+	const int max_text_width = std::max(1, (int)((double)width * 0.92) - outline_margin);
+	const int max_text_height = std::max(1, (int)((double)height * 0.84) - outline_margin);
 	int effective_font_size = std::min(display->font_size, max_text_height);
 	HFONT font = create_font(effective_font_size);
 	if (!font) {
@@ -536,38 +651,21 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 	SelectObject(memory_dc, old_font);
 	DeleteObject(font);
 
-	const uint8_t red = (uint8_t)((color >> 0) & 0xFF);
-	const uint8_t green = (uint8_t)((color >> 8) & 0xFF);
-	const uint8_t blue = (uint8_t)((color >> 16) & 0xFF);
-	const uint8_t alpha = (uint8_t)((color >> 24) & 0xFF);
 	const auto *source = static_cast<const uint8_t *>(bitmap_bits);
-	for (size_t i = 0; i < (size_t)width * (size_t)height; ++i) {
-		const uint8_t mask = std::max(source[(i * 4) + 0],
-					      std::max(source[(i * 4) + 1], source[(i * 4) + 2]));
-		pixels[(i * 4) + 0] = (uint8_t)(((uint16_t)blue * mask) / 255);
-		pixels[(i * 4) + 1] = (uint8_t)(((uint16_t)green * mask) / 255);
-		pixels[(i * 4) + 2] = (uint8_t)(((uint16_t)red * mask) / 255);
-		pixels[(i * 4) + 3] = (uint8_t)(((uint16_t)alpha * mask) / 255);
-	}
+	std::vector<uint8_t> mask((size_t)width * (size_t)height);
+	for (size_t i = 0; i < mask.size(); ++i)
+		mask[i] = std::max(source[(i * 4) + 0], std::max(source[(i * 4) + 1], source[(i * 4) + 2]));
 
 	SelectObject(memory_dc, old_bitmap);
 	DeleteObject(bitmap);
 	DeleteDC(memory_dc);
 
-	const uint8_t *texture_data = pixels.data();
-	display->text_texture = gs_texture_create(display->width, display->height, GS_BGRA, 1, &texture_data, 0);
-	display->cached_font_valid = display->text_texture != nullptr;
-	display->cached_text = text;
-	display->cached_color = color;
-	display->cached_width = display->width;
-	display->cached_height = display->height;
-	display->cached_font_face = display->font_face;
-	display->cached_font_size = display->font_size;
-	display->cached_font_flags = display->font_flags;
+	create_text_texture(display, text, color, mask);
 #else
 	UNUSED_PARAMETER(display);
 	UNUSED_PARAMETER(text);
 	UNUSED_PARAMETER(color);
+	UNUSED_PARAMETER(outline_margin);
 #endif
 }
 
@@ -617,7 +715,7 @@ void draw_system_font_glow(BpmDisplaySource *display, const std::string &text, u
 	gs_blend_state_pop();
 }
 
-void draw_segment_text(BpmDisplaySource *display, const std::string &text, uint32_t color_rgba)
+void draw_segment_text(BpmDisplaySource *display, const std::string &text, uint32_t color_rgba, float grow = 0.0f)
 {
 	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
 	gs_eparam_t *color_param = gs_effect_get_param_by_name(solid, "color");
@@ -644,9 +742,9 @@ void draw_segment_text(BpmDisplaySource *display, const std::string &text, uint3
 	for (size_t i = 0; i < text.size(); ++i) {
 		const float x = start_x + ((digit_width + spacing) * (float)i);
 		if (text[i] >= '0' && text[i] <= '9')
-			draw_digit(kDigitSegments[text[i] - '0'], x, start_y, digit_width, digit_height, thickness);
+			draw_digit(kDigitSegments[text[i] - '0'], x, start_y, digit_width, digit_height, thickness, grow);
 		else
-			draw_dash(x, start_y, digit_width, digit_height, thickness);
+			draw_dash(x, start_y, digit_width, digit_height, thickness, grow);
 	}
 
 	gs_technique_end_pass(tech);
@@ -694,19 +792,23 @@ void bpm_display_render(void *data, gs_effect_t *)
 		return;
 
 	const uint32_t color = display_color(display, value);
+	const int outline_size = effective_outline_size(display);
+	auto draw_segments = [&]() {
+		if (display->glow_enabled)
+			draw_segment_glow(display, text, color);
+		if (outline_size > 0)
+			draw_segment_text(display, text, display->outline_color, (float)outline_size);
+		draw_segment_text(display, text, color);
+	};
+
 	if (display->render_mode == RenderModeSystemFont) {
 		if (display->glow_enabled)
 			draw_system_font_glow(display, text, color);
 		draw_system_font(display, text, color);
-		if (!display->text_texture) {
-			if (display->glow_enabled)
-				draw_segment_glow(display, text, color);
-			draw_segment_text(display, text, color);
-		}
+		if (!display->text_texture)
+			draw_segments();
 	} else {
-		if (display->glow_enabled)
-			draw_segment_glow(display, text, color);
-		draw_segment_text(display, text, color);
+		draw_segments();
 	}
 }
 
@@ -721,6 +823,14 @@ bool render_mode_changed(obs_properties_t *props, obs_property_t *, obs_data_t *
 bool glow_enabled_changed(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
 {
 	obs_property_set_visible(obs_properties_get(props, "glow_softness"), obs_data_get_bool(settings, "glow_enabled"));
+	return true;
+}
+
+bool outline_enabled_changed(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	const bool enabled = obs_data_get_bool(settings, "outline_enabled");
+	obs_property_set_visible(obs_properties_get(props, "outline_color"), enabled);
+	obs_property_set_visible(obs_properties_get(props, "outline_size"), enabled);
 	return true;
 }
 
@@ -767,6 +877,12 @@ obs_properties_t *bpm_display_properties(void *)
 	obs_property_set_modified_callback(glow_enabled, glow_enabled_changed);
 	obs_properties_add_float_slider(props, "glow_softness", obs_module_text("Source.BpmDisplay.GlowSoftness"), 1.0,
 					32.0, 0.5);
+	obs_property_t *outline_enabled = obs_properties_add_bool(props, "outline_enabled",
+								  obs_module_text("Source.BpmDisplay.OutlineEnabled"));
+	obs_property_set_modified_callback(outline_enabled, outline_enabled_changed);
+	obs_properties_add_color_alpha(props, "outline_color", obs_module_text("Source.BpmDisplay.OutlineColor"));
+	obs_properties_add_int_slider(props, "outline_size", obs_module_text("Source.BpmDisplay.OutlineSize"), 1, 32,
+				      1);
 	obs_properties_add_bool(props, "show_when_disconnected",
 				obs_module_text("Source.BpmDisplay.ShowWhenDisconnected"));
 	return props;
@@ -798,6 +914,9 @@ void bpm_display_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "use_smoothed", true);
 	obs_data_set_default_bool(settings, "glow_enabled", false);
 	obs_data_set_default_double(settings, "glow_softness", 6.0);
+	obs_data_set_default_bool(settings, "outline_enabled", false);
+	obs_data_set_default_int(settings, "outline_color", 0xFF000000);
+	obs_data_set_default_int(settings, "outline_size", 4);
 	obs_data_set_default_bool(settings, "show_when_disconnected", true);
 }
 
