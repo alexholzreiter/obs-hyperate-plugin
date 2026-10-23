@@ -33,6 +33,7 @@ filter/source, so you only connect once no matter how many effects you use.
   - Built-in segmented display or system-font rendering.
   - Digit styles (Block / Bold / Digital / Slim), custom font, width/height.
   - Static color or automatic **zone colors** (Resting / Active / High / Peak), optional glow.
+  - Optional text outline with configurable color and thickness.
   - Option to keep showing while disconnected.
 - **HypeRate Actions** (`hyperate_threshold_toggle`)
   - Fires an action when your BPM crosses a configurable threshold.
