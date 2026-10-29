@@ -165,6 +165,17 @@ This installs the plugin for the current Linux user to:
 ~/.config/obs-studio/plugins/obs-hyperate
 ```
 
+## OBS 33 plugin layout
+
+OBS 33 introduced a new plugin-manager layout and labels plugins installed in the
+old locations as "Legacy". The installers therefore write **both** layouts so the
+plugin works on OBS 32 and older *and* is recognised as a modern plugin on OBS 33+
+(OBS 33 loads the modern copy first and skips the legacy duplicate):
+
+- **Windows:** legacy `…\obs-studio\obs-plugins\64bit\obs-hyperate.dll` **and** modern `C:\ProgramData\obs-studio\plugins\obs-hyperate\obs-hyperate.dll`.
+- **Linux:** legacy `~/.config/obs-studio/plugins/obs-hyperate/bin/64bit/obs-hyperate.so` **and** modern `~/.local/share/obs-studio/plugins/obs-hyperate/obs-hyperate.so`.
+- **macOS:** the `.plugin` bundle in `~/Library/Application Support/obs-studio/plugins/` is already the modern layout on all OBS versions — no change.
+
 ## Current Packaging Notes
 
 - macOS builds are not signed or notarized yet.

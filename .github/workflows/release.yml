@@ -169,13 +169,25 @@ jobs:
           #!/bin/sh
           set -eu
 
-          install_dir="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"
+          legacy_dir="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"
+          modern_dir="${XDG_DATA_HOME:-$HOME/.local/share}/obs-studio/plugins/obs-hyperate"
           archive_line="$(awk '/^__OBS_HYPERATE_ARCHIVE_BELOW__/ {print NR + 1; exit}' "$0")"
 
-          mkdir -p "${install_dir}"
-          tail -n +"${archive_line}" "$0" | tar -xz -C "${install_dir}"
+          # Legacy layout: ~/.config/obs-studio/plugins/obs-hyperate/bin/64bit/...
+          # Loaded by OBS 32 and older, and still loaded (as "Legacy") by OBS 33.
+          mkdir -p "${legacy_dir}"
+          tail -n +"${archive_line}" "$0" | tar -xz -C "${legacy_dir}"
 
-          echo "OBS HypeRate was installed to: ${install_dir}/obs-hyperate"
+          # Modern layout: ~/.local/share/obs-studio/plugins/obs-hyperate/obs-hyperate.so
+          # OBS 33 loads this first and treats the plugin as modern; older OBS ignores it.
+          rm -rf "${modern_dir}"
+          mkdir -p "${modern_dir}"
+          cp "${legacy_dir}/obs-hyperate/bin/64bit/obs-hyperate.so" "${modern_dir}/obs-hyperate.so"
+          cp -R "${legacy_dir}/obs-hyperate/data" "${modern_dir}/data"
+
+          echo "OBS HypeRate installed:"
+          echo "  legacy (OBS <=32): ${legacy_dir}/obs-hyperate"
+          echo "  modern (OBS 33+):  ${modern_dir}"
           echo "Restart OBS Studio to load the plugin."
           exit 0
           __OBS_HYPERATE_ARCHIVE_BELOW__
@@ -384,11 +396,26 @@ jobs:
           !insertmacro MUI_LANGUAGE "English"
 
           Section "Install"
+            ; Remove an old per-user manual install, if any.
+            SetShellVarContext current
             RMDir /r "$APPDATA\obs-studio\plugins\obs-hyperate"
+
+            ; Legacy layout inside the OBS install folder. Loaded by OBS 32 and
+            ; older, and still loaded (as "Legacy") by OBS 33.
             SetOutPath "$INSTDIR\obs-plugins\64bit"
             File /r "package\obs-studio\obs-plugins\64bit\*.*"
             SetOutPath "$INSTDIR\data\obs-plugins\obs-hyperate"
             File /r "package\obs-studio\data\obs-plugins\obs-hyperate\*.*"
+
+            ; Modern layout in C:\ProgramData. OBS 33 loads this first and treats
+            ; the plugin as modern (no "Legacy" badge); older OBS ignores it.
+            SetShellVarContext all
+            RMDir /r "$APPDATA\obs-studio\plugins\obs-hyperate"
+            SetOutPath "$APPDATA\obs-studio\plugins\obs-hyperate"
+            File "package\obs-studio\obs-plugins\64bit\obs-hyperate.dll"
+            SetOutPath "$APPDATA\obs-studio\plugins\obs-hyperate\data"
+            File /r "package\obs-studio\data\obs-plugins\obs-hyperate\*.*"
+
             WriteUninstaller "$INSTDIR\data\obs-plugins\obs-hyperate\Uninstall.exe"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OBS HypeRate" "DisplayName" "OBS HypeRate"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OBS HypeRate" "UninstallString" "$\"$INSTDIR\data\obs-plugins\obs-hyperate\Uninstall.exe$\""
@@ -399,18 +426,12 @@ jobs:
           Section "Uninstall"
             DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OBS HypeRate"
             SetOutPath "$TEMP"
+            ; Legacy layout
             Delete "$INSTDIR\obs-plugins\64bit\obs-hyperate.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\websockets.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\libssl-3-x64.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\libcrypto-3-x64.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\uv.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\z.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\zlib.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\pthreadVC3.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\pthreadVCE3.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\pthreadVSE3.dll"
-            Delete "$INSTDIR\obs-plugins\64bit\legacy.dll"
             RMDir /r "$INSTDIR\data\obs-plugins\obs-hyperate"
+            ; Modern layout in C:\ProgramData
+            SetShellVarContext all
+            RMDir /r "$APPDATA\obs-studio\plugins\obs-hyperate"
           SectionEnd
           '@ | Set-Content -Path $installerScript -Encoding ASCII
 
