@@ -49,6 +49,7 @@ struct BpmDisplaySource {
 	double displayed_bpm = 0.0;
 	std::chrono::steady_clock::time_point last_animation_frame = std::chrono::steady_clock::now();
 	gs_texture_t *text_texture = nullptr;
+	gs_texture_t *glow_texture = nullptr;
 	std::string cached_text;
 	uint32_t cached_color = 0;
 	uint32_t cached_width = 0;
@@ -58,6 +59,8 @@ struct BpmDisplaySource {
 	int cached_font_flags = 0;
 	uint32_t cached_outline_color = 0;
 	int cached_outline_size = 0;
+	bool cached_glow_enabled = false;
+	double cached_glow_softness = 0.0;
 	bool cached_font_valid = false;
 };
 
@@ -148,6 +151,8 @@ void bpm_display_destroy(void *data)
 	auto *display = static_cast<BpmDisplaySource *>(data);
 	if (display->text_texture)
 		gs_texture_destroy(display->text_texture);
+	if (display->glow_texture)
+		gs_texture_destroy(display->glow_texture);
 	delete display;
 }
 
@@ -285,6 +290,10 @@ void invalidate_text_texture(BpmDisplaySource *display)
 		gs_texture_destroy(display->text_texture);
 		display->text_texture = nullptr;
 	}
+	if (display->glow_texture) {
+		gs_texture_destroy(display->glow_texture);
+		display->glow_texture = nullptr;
+	}
 	display->cached_font_valid = false;
 }
 
@@ -356,6 +365,48 @@ std::vector<uint8_t> outline_coverage(const std::vector<uint8_t> &mask, int widt
 	return coverage;
 }
 
+// Separable Gaussian blur of the coverage mask, used for the soft glow. Returns
+// per-pixel coverage in 0..1.
+std::vector<float> gaussian_blur_coverage(const std::vector<uint8_t> &mask, int width, int height, float sigma)
+{
+	const int radius = std::max(1, (int)std::ceil(sigma * 3.0f));
+	std::vector<float> kernel((size_t)(2 * radius + 1));
+	float sum = 0.0f;
+	for (int i = -radius; i <= radius; ++i) {
+		kernel[(size_t)(i + radius)] = std::exp(-(float)(i * i) / (2.0f * sigma * sigma));
+		sum += kernel[(size_t)(i + radius)];
+	}
+	for (float &k : kernel)
+		k /= sum;
+
+	std::vector<float> src((size_t)width * height);
+	for (size_t i = 0; i < src.size(); ++i)
+		src[i] = (float)mask[i] / 255.0f;
+
+	std::vector<float> tmp(src.size(), 0.0f);
+	for (int y = 0; y < height; ++y)
+		for (int x = 0; x < width; ++x) {
+			float a = 0.0f;
+			for (int i = -radius; i <= radius; ++i) {
+				const int xx = std::clamp(x + i, 0, width - 1);
+				a += src[(size_t)y * width + xx] * kernel[(size_t)(i + radius)];
+			}
+			tmp[(size_t)y * width + x] = a;
+		}
+
+	std::vector<float> dst(src.size(), 0.0f);
+	for (int y = 0; y < height; ++y)
+		for (int x = 0; x < width; ++x) {
+			float a = 0.0f;
+			for (int i = -radius; i <= radius; ++i) {
+				const int yy = std::clamp(y + i, 0, height - 1);
+				a += tmp[(size_t)yy * width + x] * kernel[(size_t)(i + radius)];
+			}
+			dst[(size_t)y * width + x] = a;
+		}
+	return dst;
+}
+
 void create_text_texture(BpmDisplaySource *display, const std::string &text, uint32_t color,
 			 const std::vector<uint8_t> &mask)
 {
@@ -399,6 +450,31 @@ void create_text_texture(BpmDisplaySource *display, const std::string &text, uin
 	display->cached_font_flags = display->font_flags;
 	display->cached_outline_color = display->outline_color;
 	display->cached_outline_size = outline_size;
+
+	// Soft glow: gaussian-blur the coverage mask and tint it with the text colour,
+	// stored as its own texture that is drawn once behind the text. This replaces the
+	// old approach of stamping offset copies, which looked like a hard multi-shadow.
+	if (display->glow_texture) {
+		gs_texture_destroy(display->glow_texture);
+		display->glow_texture = nullptr;
+	}
+	if (display->glow_enabled) {
+		const float sigma = std::max(0.75f, (float)display->glow_softness * 0.9f);
+		const std::vector<float> blurred = gaussian_blur_coverage(mask, width, height, sigma);
+		std::vector<uint8_t> glow_pixels(mask.size() * 4, 0);
+		for (size_t i = 0; i < mask.size(); ++i) {
+			const float a = std::clamp(blurred[i] * 1.8f, 0.0f, 1.0f);
+			if (a <= 0.0f)
+				continue;
+			for (int c = 0; c < 3; ++c)
+				glow_pixels[(i * 4) + c] = (uint8_t)std::clamp(std::lround(text_rgb[c]), 0l, 255l);
+			glow_pixels[(i * 4) + 3] = (uint8_t)std::clamp(std::lround(a * 255.0f), 0l, 255l);
+		}
+		const uint8_t *glow_data = glow_pixels.data();
+		display->glow_texture = gs_texture_create(display->width, display->height, GS_BGRA, 1, &glow_data, 0);
+	}
+	display->cached_glow_enabled = display->glow_enabled;
+	display->cached_glow_softness = display->glow_softness;
 }
 
 void ensure_system_font_texture(BpmDisplaySource *display, const std::string &text, uint32_t color)
@@ -408,7 +484,9 @@ void ensure_system_font_texture(BpmDisplaySource *display, const std::string &te
 	    display->cached_height == display->height && display->cached_font_face == display->font_face &&
 	    display->cached_font_size == display->font_size && display->cached_font_flags == display->font_flags &&
 	    display->cached_outline_color == display->outline_color &&
-	    display->cached_outline_size == effective_outline_size(display)) {
+	    display->cached_outline_size == effective_outline_size(display) &&
+	    display->cached_glow_enabled == display->glow_enabled &&
+	    display->cached_glow_softness == display->glow_softness) {
 		return;
 	}
 
@@ -686,32 +764,18 @@ void draw_system_font(BpmDisplaySource *display, const std::string &text, uint32
 void draw_system_font_glow(BpmDisplaySource *display, const std::string &text, uint32_t color)
 {
 	ensure_system_font_texture(display, text, color);
-	if (!display->text_texture)
+	if (!display->glow_texture)
 		return;
 
+	// Draw the pre-blurred, tinted glow texture once behind the text.
 	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
-	gs_effect_set_texture_srgb(image, display->text_texture);
-
-	const float radius = (float)display->glow_softness;
-	const float inner = std::max(1.0f, radius * 0.45f);
-	const float outer = std::max(inner + 1.0f, radius);
-	const float offsets[][2] = {
-		{-inner, 0.0f}, {inner, 0.0f}, {0.0f, -inner}, {0.0f, inner},
-		{-inner, -inner}, {inner, -inner}, {-inner, inner}, {inner, inner},
-		{-outer, 0.0f}, {outer, 0.0f}, {0.0f, -outer}, {0.0f, outer},
-		{-outer, -outer}, {outer, -outer}, {-outer, outer}, {outer, outer},
-	};
+	gs_effect_set_texture_srgb(image, display->glow_texture);
 
 	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_ONE);
-	for (const auto &offset : offsets) {
-		gs_matrix_push();
-		gs_matrix_translate3f(offset[0], offset[1], 0.0f);
-		while (gs_effect_loop(effect, "Draw"))
-			gs_draw_sprite(display->text_texture, 0, display->width, display->height);
-		gs_matrix_pop();
-	}
+	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(display->glow_texture, 0, display->width, display->height);
 	gs_blend_state_pop();
 }
 
