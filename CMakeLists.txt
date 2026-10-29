@@ -122,6 +122,7 @@ if(HYPERATE_WITH_LIBWEBSOCKETS AND HYPERATE_LWS_TARGET)
         shell32
         psapi
         winhttp
+        synchronization
     )
   endif()
 elseif(HYPERATE_WITH_LIBWEBSOCKETS AND LIBWEBSOCKETS_FOUND)
